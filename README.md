@@ -26,12 +26,12 @@ A complete reference for setting up Laravel Reverb (WebSockets) on a production 
 12. Common Issues and Solutions
 
 ---
+
 ## Overview
 |                                                    |
 | :------------------------------------------------: |
 |                  Preview                  |
 | ![preview](/reverb.png) |
-
 
 ## 1. Prerequisites and Packages
 
@@ -418,20 +418,116 @@ This block proxies all WebSocket connections (`wss://your-domain.com/app/...`) t
 
 ### Where exactly to place it
 
-Your existing port 443 server block looks like this in its relevant section:
+It must come before `location /`. Nginx matches prefix location blocks in the order they appear. If `location /` is first, Nginx routes WebSocket traffic through Varnish instead of Reverb and the upgrade fails with a 500 error.
+
+### Full demo vhost
+
+The line marked `[NEW BLOCK START]` and `[NEW BLOCK END]` is the only addition. Everything else is a standard CloudPanel-generated vhost and should already exist in your file.
 
 ```nginx
+server {
+  listen 80;
+  listen [::]:80;
+  listen 443 ssl http2;
+  listen [::]:443 ssl http2;
+  {{ssl_certificate_key}}
+  {{ssl_certificate}}
+  server_name your-domain.com;
+  {{root}}
+  {{nginx_access_log}}
+  {{nginx_error_log}}
+
+  if ($scheme != "https") {
+    rewrite ^ https://$host$uri permanent;
+  }
+
+  location ~ /.well-known {
+    auth_basic off;
+    allow all;
+  }
+
   {{settings}}
 
-  # --- paste the location /app block here ---
+  # [NEW BLOCK START] — paste this before location /
+  location /app {
+    proxy_pass http://127.0.0.1:9000;
+    proxy_http_version 1.1;
+    proxy_set_header Host              $http_host;
+    proxy_set_header Upgrade           $http_upgrade;
+    proxy_set_header Connection        "Upgrade";
+    proxy_set_header X-Real-IP         $remote_addr;
+    proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto $scheme;
+    proxy_set_header X-Forwarded-Port  443;
+    proxy_read_timeout    3600;
+    proxy_send_timeout    3600;
+    proxy_connect_timeout 3600;
+  }
+  # [NEW BLOCK END]
 
   location / {
-      {{varnish_proxy_pass}}
-      ...
+    {{varnish_proxy_pass}}
+    proxy_set_header Host $http_host;
+    proxy_set_header X-Forwarded-Host $http_host;
+    proxy_set_header X-Real-IP $remote_addr;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_hide_header X-Varnish;
+    proxy_redirect off;
+    proxy_max_temp_file_size 0;
+    proxy_connect_timeout      720;
+    proxy_send_timeout         720;
+    proxy_read_timeout         720;
+    proxy_buffer_size          128k;
+    proxy_buffers              4 256k;
+    proxy_busy_buffers_size    256k;
+    proxy_temp_file_write_size 256k;
   }
-```
 
-It must come before `location /`. Nginx matches prefix location blocks in the order they appear. If `location /` is first, Nginx routes WebSocket traffic through Varnish instead of Reverb and the upgrade fails with a 500 error.
+  location ~* ^.+\.(css|js|jpg|jpeg|gif|png|ico|gz|svg|svgz|ttf|otf|woff|woff2|eot|mp4|ogg|ogv|webm|webp|zip|swf|map)$ {
+    add_header Access-Control-Allow-Origin "*";
+    expires max;
+    access_log off;
+  }
+
+  if (-f $request_filename) {
+    break;
+  }
+}
+
+# Port 8080 server block — no changes needed here
+server {
+  listen 8080;
+  listen [::]:8080;
+  server_name your-domain.com;
+  {{root}}
+  try_files $uri $uri/ /index.php?$args;
+  index index.php index.html;
+
+  location ~ \.php$ {
+    include fastcgi_params;
+    fastcgi_intercept_errors on;
+    fastcgi_index index.php;
+    fastcgi_param SCRIPT_FILENAME $document_root$fastcgi_script_name;
+    try_files $uri =404;
+    fastcgi_read_timeout 3600;
+    fastcgi_send_timeout 3600;
+    fastcgi_param HTTPS "on";
+    fastcgi_param SERVER_PORT 443;
+    fastcgi_pass 127.0.0.1:{{php_fpm_port}};
+    fastcgi_param PHP_VALUE "{{php_settings}}";
+  }
+
+  location ~* ^.+\.(css|js|jpg|jpeg|gif|png|ico|gz|svg|svgz|ttf|otf|woff|woff2|eot|mp4|ogg|ogv|webm|webp|zip|swf|map)$ {
+    add_header Access-Control-Allow-Origin "*";
+    expires max;
+    access_log off;
+  }
+
+  if (-f $request_filename) {
+    break;
+  }
+}
+```
 
 ### After editing
 
@@ -840,8 +936,6 @@ sudo supervisorctl restart queue-worker:*
 ```
 
 These four commands cover the vast majority of deployment scenarios. Clear caches first so Reverb and the queue worker pick up the new configuration.
-
-
 ---
 
 ## Author
